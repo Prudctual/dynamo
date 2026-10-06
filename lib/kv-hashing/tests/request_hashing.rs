@@ -434,6 +434,38 @@ fn request_sequence_hashes_match_canonical_chain() {
 }
 
 #[test]
+fn text_blocks_around_mm_run_match_in_place_token_hash() {
+    use dynamo_tokens::compute_block_hash_for_tokens;
+
+    let tokens: Vec<Token> = (0..12).collect();
+    let request = req(
+        tokens.clone(),
+        None,
+        None,
+        vec![RequestMmObjectInfo {
+            mm_hash: 0xAB,
+            offset: 4,
+            length: 4,
+        }],
+    );
+    let hashes = request.block_hashes(4).unwrap();
+    let salt = request.salt_hash().unwrap();
+    assert_eq!(hashes.len(), 3);
+    assert_eq!(
+        hashes[0],
+        compute_block_hash_for_tokens(&tokens[0..4], salt)
+    );
+    assert_eq!(
+        hashes[2],
+        compute_block_hash_for_tokens(&tokens[8..12], salt)
+    );
+    assert_ne!(
+        hashes[1],
+        compute_block_hash_for_tokens(&tokens[4..8], salt)
+    );
+}
+
+#[test]
 fn consuming_sequence_hashes_match_borrowed_path() {
     let tokens: Vec<Token> = (1u32..=20).collect();
     let block_size: u32 = 4;
