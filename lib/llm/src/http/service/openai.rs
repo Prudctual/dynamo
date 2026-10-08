@@ -56,7 +56,10 @@ use super::{
     service_v2::{self, BackendErrorCheck},
 };
 use crate::engines::ValidateRequest;
-use crate::preprocessor::{PRESERVE_OMITTED_MAX_TOKENS_CONTEXT_KEY, decode_base64_to_floats};
+use crate::preprocessor::{
+    PRESERVE_OMITTED_MAX_TOKENS_CONTEXT_KEY, REQUEST_PARSING_OPTIONS_CONTEXT_KEY,
+    decode_base64_to_floats,
+};
 use crate::protocols::common::extensions::{
     AGENT_CONTEXT_CONTEXT_KEY, AgentContext, InputTrigger, NvExt as CommonNvExt,
     SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId, agent_context_from_headers,
@@ -68,7 +71,7 @@ use crate::protocols::common::input_trigger::{
 use crate::protocols::openai::chat_completions::aggregator::ChatCompletionAggregator;
 use crate::protocols::openai::{
     ParsingOptions,
-    audios::{NvAudioSpeechResponse, NvCreateAudioSpeechRequest},
+    audios::{AudioDataSource, NvAudioSpeechResponse, NvCreateAudioSpeechRequest},
     chat_completions::{
         NvCreateChatCompletionRequest, NvCreateChatCompletionResponse,
         NvCreateChatCompletionStreamResponse,
@@ -1324,22 +1327,7 @@ async fn completions_single(
     // capture the context to cancel the stream if the client disconnects
     let ctx = stream.context();
 
-    let annotations = annotations.map_or(Vec::new(), |annotations| {
-        annotations
-            .iter()
-            .filter_map(|annotation| {
-                if annotation == ANNOTATION_REQUEST_ID {
-                    Annotated::<NvCreateCompletionResponse>::from_annotation(
-                        ANNOTATION_REQUEST_ID,
-                        &request_id,
-                    )
-                    .ok()
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-    });
+    let annotations = requested_request_id_annotations(annotations, &request_id);
 
     // apply any annotations to the front of the stream
     let stream = stream::iter(annotations).chain(stream);
@@ -1687,22 +1675,7 @@ async fn completions_batch(
     // monitor kills, so the monitor below observes the same stop signal.
     let ctx = parent_ctx;
 
-    let annotations_vec = annotations.map_or(Vec::new(), |annotations| {
-        annotations
-            .iter()
-            .filter_map(|annotation| {
-                if annotation == ANNOTATION_REQUEST_ID {
-                    Annotated::<NvCreateCompletionResponse>::from_annotation(
-                        ANNOTATION_REQUEST_ID,
-                        &request_id,
-                    )
-                    .ok()
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-    });
+    let annotations_vec = requested_request_id_annotations(annotations, &request_id);
 
     // apply any annotations to the front of the stream
     let merged_stream = stream::iter(annotations_vec).chain(merged_stream);
@@ -3027,6 +3000,28 @@ fn is_annotation_frame<T>(e: &Annotated<T>) -> bool {
 /// (currently just `request_id`) fits well under this cap.
 const MAX_LEADING_ANNOTATIONS: usize = 16;
 
+/// Build the `request_id` annotation frames requested via `nvext.annotations`.
+///
+/// That list is a free-form `Vec<String>`, so a client can repeat
+/// `"request_id"` enough times to fill [`MAX_LEADING_ANNOTATIONS`] before the
+/// pre-commit peek sees a backend refusal. Emit at most one frame.
+fn requested_request_id_annotations<T: serde::Serialize>(
+    requested: Option<Vec<String>>,
+    request_id: &str,
+) -> Vec<Annotated<T>> {
+    if requested
+        .as_ref()
+        .is_some_and(|names| names.iter().any(|name| name == ANNOTATION_REQUEST_ID))
+    {
+        Annotated::from_annotation(ANNOTATION_REQUEST_ID, &request_id)
+            .ok()
+            .into_iter()
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
 /// Inspect the first non-annotation event in the stream for a backend error.
 ///
 /// `BackendErrorCheck::UntilFirstEvent` awaits stream events indefinitely: the
@@ -3577,6 +3572,7 @@ async fn chat_completions(
         );
     let parsing_options = parsing_options
         .with_move_reasoning_to_content_when_empty(move_reasoning_to_content_when_empty);
+    request.insert(REQUEST_PARSING_OPTIONS_CONTEXT_KEY, parsing_options.clone());
 
     // Computed before `request` moves into `generate`. Only a stream that can
     // withhold every data frame needs forced keep-alive frames.
@@ -3605,18 +3601,7 @@ async fn chat_completions(
     let ctx = stream.context();
 
     // prepare any requested annotations
-    let annotations = annotations.map_or(Vec::new(), |annotations| {
-        annotations
-            .iter()
-            .filter_map(|annotation| {
-                if annotation == ANNOTATION_REQUEST_ID {
-                    Annotated::from_annotation(ANNOTATION_REQUEST_ID, &request_id).ok()
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-    });
+    let annotations = requested_request_id_annotations(annotations, &request_id);
 
     // apply any annotations to the front of the stream
     let stream = stream::iter(annotations).chain(stream);
@@ -3945,16 +3930,18 @@ pub fn validate_chat_completion_stream_options(
     Ok(())
 }
 
-/// Validates a chat completion request and returns an error response if validation fails.
+/// Validates a request and maps a failure to an OpenAI-compatible error response.
 ///
-/// This function calls the `validate` method implemented for `NvCreateChatCompletionRequest`.
-/// If validation fails, it maps the error into an OpenAI-compatible error response.
-pub fn validate_chat_completion_fields_generic(
-    request: &NvCreateChatCompletionRequest,
+/// `request_kind` names the request kind in the message of a backend
+/// `InvalidArgument` error, for example "chat completion". Every other validation failure
+/// becomes a 400 with the [`VALIDATION_PREFIX`] message.
+fn validate_request_fields_generic<R: ValidateRequest>(
+    request: &R,
+    request_kind: &str,
 ) -> Result<(), ErrorResponse> {
     request.validate().map_err(|e| {
         if find_invalid_argument_in_chain(e.as_ref()).is_some() {
-            return ErrorMessage::from_anyhow(e, "Invalid chat completion request");
+            return ErrorMessage::from_anyhow(e, &format!("Invalid {request_kind} request"));
         }
         ErrorMessage::from_http_error(
             ErrorClass::InvalidRequest,
@@ -3964,6 +3951,13 @@ pub fn validate_chat_completion_fields_generic(
             },
         )
     })
+}
+
+/// Validates a chat completion request and returns an error response if validation fails.
+pub fn validate_chat_completion_fields_generic(
+    request: &NvCreateChatCompletionRequest,
+) -> Result<(), ErrorResponse> {
+    validate_request_fields_generic(request, "chat completion")
 }
 
 /// Validates that stream_options is only used when stream=true for completions (NVBug 5662680)
@@ -3986,24 +3980,10 @@ pub fn validate_completion_stream_options(
 }
 
 /// Validates a completion request and returns an error response if validation fails.
-///
-/// This function calls the `validate` method implemented for `NvCreateCompletionRequest`.
-/// If validation fails, it maps the error into an OpenAI-compatible error response.
 pub fn validate_completion_fields_generic(
     request: &NvCreateCompletionRequest,
 ) -> Result<(), ErrorResponse> {
-    request.validate().map_err(|e| {
-        if find_invalid_argument_in_chain(e.as_ref()).is_some() {
-            return ErrorMessage::from_anyhow(e, "Invalid completion request");
-        }
-        ErrorMessage::from_http_error(
-            ErrorClass::InvalidRequest,
-            HttpError {
-                code: 400,
-                message: VALIDATION_PREFIX.to_string() + &e.to_string(),
-            },
-        )
-    })
+    validate_request_fields_generic(request, "completion")
 }
 
 /// OpenAI Responses input-token counting handler.
@@ -4303,6 +4283,7 @@ async fn responses(
         );
     let parsing_options = parsing_options
         .with_move_reasoning_to_content_when_empty(move_reasoning_to_content_when_empty);
+    request.insert(REQUEST_PARSING_OPTIONS_CONTEXT_KEY, parsing_options.clone());
 
     // Computed before `request` moves into `generate`. Responses streams use
     // the same force-nonempty deferral as chat completions and therefore need
@@ -5588,7 +5569,9 @@ async fn handler_audio_speech(
     // Option<String> model field; see below)
     check_ready(&state)?;
 
-    let returns_audio_bytes = request.data_source.as_deref() != Some("url");
+    validate_request_fields_generic(&request, "audio speech")?;
+
+    let returns_audio_bytes = request.data_source != Some(AudioDataSource::Url);
     let streams_audio_chunks = returns_audio_bytes
         && matches!(
             request.response_format.as_deref().unwrap_or("wav"),
@@ -8810,6 +8793,7 @@ mod tests {
                 nvext: None,
                 prompt_logprobs: None,
                 llm_metrics: None,
+                tool_call_completion: Vec::new(),
             }),
             id: Some("msg-1".to_string()),
             event: None,
@@ -9461,6 +9445,7 @@ mod tests {
                 nvext: None,
                 prompt_logprobs: None,
                 llm_metrics: None,
+                tool_call_completion: Vec::new(),
             }),
             id: Some("msg-1".to_string()),
             event: None,
@@ -9478,6 +9463,62 @@ mod tests {
         assert_eq!(first.event.as_deref(), Some(ANNOTATION_REQUEST_ID));
         let second = returned.remove(0);
         assert_eq!(second.id, Some("msg-1".to_string()));
+    }
+
+    #[test]
+    fn requested_request_id_annotations_emits_at_most_one_frame() {
+        use crate::types::openai::chat_completions::NvCreateChatCompletionStreamResponse;
+
+        let repeated = vec![ANNOTATION_REQUEST_ID.to_string(); MAX_LEADING_ANNOTATIONS + 1];
+        let frames = requested_request_id_annotations::<NvCreateChatCompletionStreamResponse>(
+            Some(repeated),
+            "req-123",
+        );
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].event.as_deref(), Some(ANNOTATION_REQUEST_ID));
+
+        let none = requested_request_id_annotations::<NvCreateChatCompletionStreamResponse>(
+            Some(vec!["other".to_string()]),
+            "req-123",
+        );
+        assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_request_id_annotations_still_surface_backend_error() {
+        use crate::types::openai::chat_completions::NvCreateChatCompletionStreamResponse;
+        use futures::stream;
+
+        let mut events = requested_request_id_annotations::<NvCreateChatCompletionStreamResponse>(
+            Some(vec![
+                ANNOTATION_REQUEST_ID.to_string();
+                MAX_LEADING_ANNOTATIONS + 1
+            ]),
+            "req-123",
+        );
+        events.push(Annotated::<NvCreateChatCompletionStreamResponse> {
+            data: None,
+            id: None,
+            event: Some("error".to_string()),
+            comment: Some(vec![
+                r#"{"message":"bad input from client","code":400}"#.to_string(),
+            ]),
+            error: None,
+        });
+
+        let result = check_for_backend_error(
+            stream::iter(events),
+            BackendErrorCheck::Bounded(service_v2::DEFAULT_PRE_COMMIT_ERROR_PEEK),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "deduped request_id annotations must leave room for the default peek to see the refusal"
+        );
+        if let Err(error_response) = result {
+            assert_eq!(error_response.0, StatusCode::BAD_REQUEST);
+        }
     }
 
     /// The timeout branch of a `Bounded` check is the one path that hands back
@@ -9552,6 +9593,7 @@ mod tests {
                 nvext: None,
                 prompt_logprobs: None,
                 llm_metrics: None,
+                tool_call_completion: Vec::new(),
             }),
             id: Some("msg-1".to_string()),
             event: None,
@@ -9571,6 +9613,56 @@ mod tests {
         assert!(first.is_some());
         let first_event = first.unwrap();
         assert_eq!(first_event.id, Some("msg-1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_pre_commit_peek_returns_on_first_token_without_waiting_full_window() {
+        use crate::types::openai::chat_completions::NvCreateChatCompletionStreamResponse;
+        use dynamo_protocols::types::CreateChatCompletionStreamResponse;
+        use futures::StreamExt;
+
+        let normal_event = Annotated::<NvCreateChatCompletionStreamResponse> {
+            data: Some(NvCreateChatCompletionStreamResponse {
+                inner: CreateChatCompletionStreamResponse {
+                    id: "test-id".to_string(),
+                    choices: vec![],
+                    created: 0,
+                    model: "test-model".to_string(),
+                    system_fingerprint: None,
+                    object: "chat.completion.chunk".to_string(),
+                    service_tier: None,
+                    usage: None,
+                },
+                nvext: None,
+                prompt_logprobs: None,
+                llm_metrics: None,
+                tool_call_completion: Vec::new(),
+            }),
+            id: Some("msg-1".to_string()),
+            event: None,
+            comment: None,
+            error: None,
+        };
+
+        let window = std::time::Duration::from_millis(250);
+        let started = tokio::time::Instant::now();
+        let stream = async_stream::stream! {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            yield normal_event;
+        };
+        let result = check_for_backend_error(stream, BackendErrorCheck::Bounded(window)).await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_ok(), "first-token peek must not fail");
+        let mut returned_stream = result.unwrap();
+        assert_eq!(
+            returned_stream.next().await.and_then(|event| event.id),
+            Some("msg-1".to_string())
+        );
+        assert!(
+            elapsed < window,
+            "peek must return on the first token instead of waiting the full window; elapsed={elapsed:?}"
+        );
     }
 
     #[tokio::test]
@@ -9964,6 +10056,7 @@ mod tests {
             nvext: None,
             prompt_logprobs: None,
             llm_metrics: None,
+            tool_call_completion: Vec::new(),
         };
         Annotated {
             id: Some("test-id".to_string()),
@@ -10599,6 +10692,7 @@ mod tests {
             nvext: None,
             prompt_logprobs: None,
             llm_metrics: None,
+            tool_call_completion: Vec::new(),
         }
     }
 

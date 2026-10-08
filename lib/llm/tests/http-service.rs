@@ -1783,9 +1783,8 @@ async fn test_nvext_disabled_strips_request_and_response() {
 /// the peek-before-200 helper with chat_completions, so an `InvalidArgument`
 /// frame at t=0 must land as HTTP 400, not HTTP 200 + generic 500 SSE.
 ///
-/// The pre-commit peek is off by default, so the bounded window that
-/// `DYN_HTTP_PRE_COMMIT_ERROR_PEEK_MS` would configure is set through the
-/// builder here instead.
+/// The bounded window is set through the builder so this test does not depend
+/// on `DYN_HTTP_PRE_COMMIT_ERROR_PEEK_MS` in the environment.
 #[tokio::test]
 async fn test_streaming_responses_returns_4xx_on_backend_invalid_argument() {
     let (listener, port) = bind_random_port().await;
@@ -1848,6 +1847,124 @@ async fn test_streaming_responses_returns_4xx_on_backend_invalid_argument() {
     assert!(
         text.contains(INVALID_ARGUMENT_MESSAGE),
         "expected typed backend error message forwarded to client; got: {text}"
+    );
+
+    cancel_token.cancel();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn test_streaming_chat_default_peek_returns_4xx_on_backend_invalid_argument() {
+    let (listener, port) = bind_random_port().await;
+    let service = HttpService::builder()
+        .port(port)
+        .enable_chat_endpoints(true)
+        .build()
+        .unwrap();
+    let state = service.state_clone();
+
+    let token = CancellationToken::new();
+    let cancel_token = token.clone();
+    let task = tokio::spawn(async move { service.run_with_listener(token, listener).await });
+    wait_for_service_ready(port).await;
+
+    let card = ModelDeploymentCard::with_name_only("invalid-arg-model");
+    state
+        .manager()
+        .add_chat_completions_model(
+            "invalid-arg-model",
+            card.mdcsum(),
+            Arc::new(InvalidArgumentEngine {
+                delay: std::time::Duration::ZERO,
+            }),
+        )
+        .unwrap();
+
+    let response = timeout(
+        std::time::Duration::from_secs(5),
+        reqwest::Client::new()
+            .post(format!("http://localhost:{port}/v1/chat/completions"))
+            .json(&serde_json::json!({
+                "model": "invalid-arg-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true,
+                "max_tokens": 1
+            }))
+            .send(),
+    )
+    .await
+    .expect("response headers did not arrive")
+    .expect("POST /v1/chat/completions");
+
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "default peek must map a first-frame refusal before HTTP 200; body: {text}"
+    );
+    assert!(
+        text.contains(INVALID_ARGUMENT_MESSAGE),
+        "expected typed backend error message; got: {text}"
+    );
+
+    cancel_token.cancel();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn test_streaming_chat_default_peek_keeps_healthy_stream() {
+    let (listener, port) = bind_random_port().await;
+    let service = HttpService::builder()
+        .port(port)
+        .enable_chat_endpoints(true)
+        .build()
+        .unwrap();
+    let state = service.state_clone();
+
+    let token = CancellationToken::new();
+    let cancel_token = token.clone();
+    let task = tokio::spawn(async move { service.run_with_listener(token, listener).await });
+    wait_for_service_ready(port).await;
+
+    let card = ModelDeploymentCard::with_name_only("happy-path-model");
+    state
+        .manager()
+        .add_chat_completions_model(
+            "happy-path-model",
+            card.mdcsum(),
+            Arc::new(CounterEngine {}),
+        )
+        .unwrap();
+
+    let response = timeout(
+        std::time::Duration::from_secs(5),
+        reqwest::Client::new()
+            .post(format!("http://localhost:{port}/v1/chat/completions"))
+            .json(&serde_json::json!({
+                "model": "happy-path-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true,
+                "max_tokens": 1
+            }))
+            .send(),
+    )
+    .await
+    .expect("response headers did not arrive")
+    .expect("POST /v1/chat/completions");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = timeout(std::time::Duration::from_secs(5), response.text())
+        .await
+        .expect("stream did not finish")
+        .expect("read body");
+    assert!(
+        body.contains("choice 0"),
+        "missing generated tokens: {body}"
+    );
+    assert!(
+        !body.contains("Internal server error"),
+        "healthy stream carried an error frame: {body}"
     );
 
     cancel_token.cancel();
@@ -2831,6 +2948,83 @@ async fn test_audio_speech_disconnect_before_first_chunk_cancels_engine() {
     )
     .await
     .expect("disconnect before first audio must cancel the engine context");
+
+    cancel_token.cancel();
+    task.await.unwrap().unwrap();
+}
+
+/// Audio engine that must not receive a request. The frontend rejects the
+/// request before dispatch. A call to `generate` is a test failure.
+struct UncalledAudiosEngine {}
+
+#[async_trait]
+impl
+    AsyncEngine<
+        SingleIn<NvCreateAudioSpeechRequest>,
+        ManyOut<Annotated<NvAudioSpeechResponse>>,
+        Error,
+    > for UncalledAudiosEngine
+{
+    async fn generate(
+        &self,
+        _request: SingleIn<NvCreateAudioSpeechRequest>,
+    ) -> Result<ManyOut<Annotated<NvAudioSpeechResponse>>, Error> {
+        anyhow::bail!("engine must not be reached by a rejected request")
+    }
+}
+
+/// The frontend owns the `speed` range rule (0.25 to 4.0). A value outside
+/// the range returns a 400 that names the field. The engine does not see the
+/// request.
+#[tokio::test]
+async fn test_audio_speech_speed_out_of_range_returns_400() {
+    let (listener, port) = bind_random_port().await;
+    let service = HttpService::builder().port(port).build().unwrap();
+    service
+        .enable_model_endpoint(dynamo_llm::endpoint_type::EndpointType::Audios, true)
+        .unwrap();
+
+    let state = service.state_clone();
+    let manager = state.manager();
+
+    let token = CancellationToken::new();
+    let cancel_token = token.clone();
+    let task =
+        tokio::spawn(async move { service.run_with_listener(token.clone(), listener).await });
+    wait_for_service_ready(port).await;
+
+    let card = ModelDeploymentCard::with_name_only("tts-model");
+    manager
+        .add_audios_model(
+            "tts-model",
+            card.mdcsum(),
+            Arc::new(UncalledAudiosEngine {}),
+        )
+        .unwrap();
+
+    let response = reqwest::Client::new()
+        .post(format!("http://localhost:{port}/v1/audio/speech"))
+        .json(&serde_json::json!({
+            "model": "tts-model",
+            "input": "The quick brown fox jumps over the lazy dog.",
+            "speed": 99.0,
+        }))
+        .send()
+        .await
+        .expect("POST /v1/audio/speech");
+
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a speed outside 0.25-4.0 must return HTTP 400; got {status}, body: {text}"
+    );
+    assert!(
+        text.contains("speed"),
+        "expected the validation message to name the offending field; got: {text}"
+    );
 
     cancel_token.cancel();
     task.await.unwrap().unwrap();
