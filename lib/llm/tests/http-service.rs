@@ -30,7 +30,7 @@ use dynamo_llm::{
 use dynamo_runtime::metrics::prometheus_names::{frontend_service, name_prefix};
 use dynamo_runtime::{
     CancellationToken,
-    error::{DynamoError, ErrorType as DynamoErrorType},
+    error::{DynamoError, ErrorClass, ErrorType as DynamoErrorType},
     pipeline::{
         AsyncEngine, AsyncEngineContextProvider, ManyOut, ResponseStream, SingleIn, async_trait,
     },
@@ -2836,6 +2836,83 @@ async fn test_audio_speech_disconnect_before_first_chunk_cancels_engine() {
     task.await.unwrap().unwrap();
 }
 
+/// Audio engine that must not receive a request. The frontend rejects the
+/// request before dispatch. A call to `generate` is a test failure.
+struct UncalledAudiosEngine {}
+
+#[async_trait]
+impl
+    AsyncEngine<
+        SingleIn<NvCreateAudioSpeechRequest>,
+        ManyOut<Annotated<NvAudioSpeechResponse>>,
+        Error,
+    > for UncalledAudiosEngine
+{
+    async fn generate(
+        &self,
+        _request: SingleIn<NvCreateAudioSpeechRequest>,
+    ) -> Result<ManyOut<Annotated<NvAudioSpeechResponse>>, Error> {
+        anyhow::bail!("engine must not be reached by a rejected request")
+    }
+}
+
+/// The frontend owns the `speed` range rule (0.25 to 4.0). A value outside
+/// the range returns a 400 that names the field. The engine does not see the
+/// request.
+#[tokio::test]
+async fn test_audio_speech_speed_out_of_range_returns_400() {
+    let (listener, port) = bind_random_port().await;
+    let service = HttpService::builder().port(port).build().unwrap();
+    service
+        .enable_model_endpoint(dynamo_llm::endpoint_type::EndpointType::Audios, true)
+        .unwrap();
+
+    let state = service.state_clone();
+    let manager = state.manager();
+
+    let token = CancellationToken::new();
+    let cancel_token = token.clone();
+    let task =
+        tokio::spawn(async move { service.run_with_listener(token.clone(), listener).await });
+    wait_for_service_ready(port).await;
+
+    let card = ModelDeploymentCard::with_name_only("tts-model");
+    manager
+        .add_audios_model(
+            "tts-model",
+            card.mdcsum(),
+            Arc::new(UncalledAudiosEngine {}),
+        )
+        .unwrap();
+
+    let response = reqwest::Client::new()
+        .post(format!("http://localhost:{port}/v1/audio/speech"))
+        .json(&serde_json::json!({
+            "model": "tts-model",
+            "input": "The quick brown fox jumps over the lazy dog.",
+            "speed": 99.0,
+        }))
+        .send()
+        .await
+        .expect("POST /v1/audio/speech");
+
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a speed outside 0.25-4.0 must return HTTP 400; got {status}, body: {text}"
+    );
+    assert!(
+        text.contains("speed"),
+        "expected the validation message to name the offending field; got: {text}"
+    );
+
+    cancel_token.cancel();
+    task.await.unwrap().unwrap();
+}
+
 /// Audio engine whose only response frame is a `Backend(InvalidArgument)`
 /// error — models a worker rejecting the request during deserialization
 /// (e.g. a `task_type` value outside the backend's accepted set).
@@ -3392,6 +3469,179 @@ async fn test_images_worker_internal_error_maps_to_sanitized_500() {
     assert!(
         !body.contains("secret internal detail"),
         "internal details must not leak to the client, got: {body}"
+    );
+
+    token.cancel();
+    let _ = task.await;
+}
+
+use dynamo_llm::protocols::openai::videos::{NvCreateVideoRequest, NvVideosResponse};
+use dynamo_llm::types::openai::videos::OpenAIVideosStreamingEngine;
+
+struct ErrorVideosEngine {
+    error: DynamoError,
+}
+
+#[async_trait]
+impl AsyncEngine<SingleIn<NvCreateVideoRequest>, ManyOut<Annotated<NvVideosResponse>>, Error>
+    for ErrorVideosEngine
+{
+    async fn generate(
+        &self,
+        request: SingleIn<NvCreateVideoRequest>,
+    ) -> Result<ManyOut<Annotated<NvVideosResponse>>, Error> {
+        let (_request, context) = request.transfer(());
+        let ctx = context.context();
+        let error = self.error.clone();
+        let stream = stream! {
+            yield Annotated::<NvVideosResponse> {
+                data: None,
+                id: None,
+                event: Some("error".to_string()),
+                comment: None,
+                error: Some(error),
+            };
+        };
+        Ok(ResponseStream::new(Box::pin(stream), ctx))
+    }
+}
+
+async fn start_videos_service(
+    engine: OpenAIVideosStreamingEngine,
+) -> (
+    u16,
+    Arc<Metrics>,
+    CancellationToken,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    let (listener, port) = bind_random_port().await;
+    let service = HttpService::builder().port(port).build().unwrap();
+    service
+        .enable_model_endpoint(EndpointType::Videos, true)
+        .unwrap();
+    let state = service.state_clone();
+    let metrics = state.metrics_clone();
+    let card = ModelDeploymentCard::with_name_only("video-model");
+    state
+        .manager()
+        .add_videos_model("video-model", card.mdcsum(), engine)
+        .unwrap();
+
+    let registry = Registry::new();
+    metrics.register(&registry).unwrap();
+
+    let token = CancellationToken::new();
+    let task = service.spawn_with_listener(token.clone(), listener).await;
+    wait_for_service_ready(port).await;
+    (port, metrics, token, task)
+}
+
+/// Catalog class for a worker-side material URI 403. The diagnostic is the
+/// `{message, code}` envelope `http_like_error_to_dynamo` stores for urllib
+/// `HTTPError`; metrics map this class to `ErrorType::Validation`.
+fn material_permission_denied() -> DynamoError {
+    DynamoError::builder()
+        .class(ErrorClass::PermissionDenied)
+        .diagnostic(r#"{"message":"HTTP Error 403: Forbidden","code":403}"#)
+        .build()
+}
+
+async fn post_videos_generation(port: u16, stream: bool) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("http://localhost:{}/v1/videos", port))
+        .json(&serde_json::json!({
+            "model": "video-model",
+            "prompt": "a cat running",
+            "stream": stream,
+        }))
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn assert_videos_material_403(stream: bool, request_type: RequestType) {
+    let engine: OpenAIVideosStreamingEngine = Arc::new(ErrorVideosEngine {
+        error: material_permission_denied(),
+    });
+    let (port, metrics, token, task) = start_videos_service(engine).await;
+
+    let response = post_videos_generation(port, stream).await;
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "material HTTP 403 must be HTTP 403, not {status}; body: {body}"
+    );
+    assert!(
+        !body.to_lowercase().contains("internal"),
+        "client/material 403 must not be classified as internal; got: {body}"
+    );
+    assert!(
+        body.contains("Permission denied"),
+        "catalog message missing; got: {body}"
+    );
+
+    compare_counter(
+        &metrics,
+        "video-model",
+        &Endpoint::Videos,
+        &request_type,
+        &Status::Error,
+        &ErrorType::Validation,
+        1,
+    );
+    compare_counter(
+        &metrics,
+        "video-model",
+        &Endpoint::Videos,
+        &request_type,
+        &Status::Error,
+        &ErrorType::Internal,
+        0,
+    );
+
+    token.cancel();
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn test_videos_material_http_403_is_4xx_not_internal() {
+    assert_videos_material_403(false, RequestType::Unary).await;
+}
+
+#[tokio::test]
+async fn test_videos_streaming_material_http_403_is_4xx_not_internal() {
+    assert_videos_material_403(true, RequestType::Stream).await;
+}
+
+#[tokio::test]
+async fn test_videos_internal_error_stays_500() {
+    let error = DynamoError::msg("secret internal detail: decoder panic");
+    let engine: OpenAIVideosStreamingEngine = Arc::new(ErrorVideosEngine { error });
+    let (port, metrics, token, task) = start_videos_service(engine).await;
+
+    let response = post_videos_generation(port, false).await;
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "genuine internal failure must stay HTTP 500; got {status}, body: {body}"
+    );
+    assert!(
+        !body.contains("secret internal detail"),
+        "internal details must not leak to the client, got: {body}"
+    );
+
+    compare_counter(
+        &metrics,
+        "video-model",
+        &Endpoint::Videos,
+        &RequestType::Unary,
+        &Status::Error,
+        &ErrorType::Internal,
+        1,
     );
 
     token.cancel();
