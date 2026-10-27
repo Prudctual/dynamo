@@ -36,6 +36,58 @@ pub fn queue_rejection_to_pyerr(rejection: dynamo_kv_router::scheduling::QueueRe
     error
 }
 
+// Raised by `RoutedEngine.generate` when the routed pipeline reports that no
+// worker on the request's route can serve it yet (for example, prefill routing
+// is still activating). Python chat processors re-raise it unchanged, and
+// `map_python_exception` restores `ErrorClass::WorkerUnavailable` so the client
+// gets the intended HTTP 503 instead of a generic 500.
+pyo3::create_exception!(dynamo._core, WorkerUnavailable, DynamoException);
+
+/// Convert a routed-pipeline error to a Python exception, keeping the
+/// `WorkerUnavailable` and `InvalidArgument` class that the generic [`crate::to_pyerr`] would drop.
+pub fn routed_error_to_pyerr(err: anyhow::Error) -> PyErr {
+    if is_worker_unavailable(err.as_ref()) {
+        return WorkerUnavailable::new_err(err.to_string());
+    }
+    if let Some(message) = public_invalid_argument_message(err.as_ref()) {
+        return InvalidArgument::new_err(message);
+    }
+    crate::to_pyerr(err)
+}
+
+fn is_worker_unavailable(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(cause) = current {
+        // `class()` normalizes `WorkerUnavailable` to `Unavailable`; the raw
+        // error type keeps the migratable worker-scoped distinction.
+        if cause
+            .downcast_ref::<DynamoError>()
+            .is_some_and(|error| error.error_type() == ErrorClass::WorkerUnavailable)
+        {
+            return true;
+        }
+        current = cause.source();
+    }
+    false
+}
+
+pub(crate) fn worker_unavailable_to_dynamo(py: Python<'_>, err: &PyErr) -> Option<DynamoError> {
+    if !err.is_instance_of::<WorkerUnavailable>(py) {
+        return None;
+    }
+    let message = err
+        .value(py)
+        .str()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Some(
+        DynamoError::builder()
+            .class(ErrorClass::WorkerUnavailable)
+            .message(message)
+            .build(),
+    )
+}
+
 // Raised by the in-process `SelectionService` bindings for selector failures
 // that are not malformed input. Instances carry `kind` (a stable,
 // machine-readable category) and `status_code` (an HTTP-style status) so
@@ -105,6 +157,7 @@ macro_rules! define_dynamo_exceptions {
                 "SelectionServiceError",
                 m.py().get_type::<SelectionServiceError>(),
             )?;
+            m.add("WorkerUnavailable", m.py().get_type::<WorkerUnavailable>())?;
             $(
                 m.add(stringify!($name), m.py().get_type::<$name>())?;
             )*
@@ -133,19 +186,35 @@ define_dynamo_exceptions!(
     (Cancelled, BackendError::Cancelled),
     (EngineShutdown, BackendError::EngineShutdown),
     (StreamIncomplete, BackendError::StreamIncomplete),
+    (WorkerOverloaded, BackendError::WorkerOverloaded),
 );
 
-/// Preserve explicitly public validation errors across Rust-to-Python streams.
-/// Other errors retain the iterator's existing `ValueError` behavior; diagnostic
-/// text must never be promoted into a public `InvalidArgument` message.
+/// Generic label for an InvalidRequest that carries no explicit
+/// public message.
+const GENERIC_INVALID_REQUEST_MESSAGE: &str = "Invalid request";
+
+fn invalid_request_client_message(error: &DynamoError) -> Option<String> {
+    (error.class() == ErrorClass::InvalidRequest).then(|| {
+        error
+            .public_message()
+            .unwrap_or(GENERIC_INVALID_REQUEST_MESSAGE)
+            .to_owned()
+    })
+}
+
+/// Preserve validation errors across Rust-to-Python streams: a classified
+/// InvalidRequest raises a typed `InvalidArgument`, carrying the producer's
+/// public message or the generic label when there is none. Other errors
+/// retain the iterator's existing `ValueError` behavior; diagnostic text must
+/// never be promoted into a public `InvalidArgument` message.
 pub(crate) fn check_response_error<R>(response: Annotated<R>) -> PyResult<Annotated<R>> {
     if response.is_error()
         && let Some(message) = response
             .error
             .as_ref()
-            .and_then(public_invalid_request_message)
+            .and_then(invalid_request_client_message)
     {
-        return Err(InvalidArgument::new_err(message.to_owned()));
+        return Err(InvalidArgument::new_err(message));
     }
 
     response
@@ -153,35 +222,57 @@ pub(crate) fn check_response_error<R>(response: Annotated<R>) -> PyResult<Annota
         .map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
-fn public_invalid_request_message(error: &DynamoError) -> Option<&str> {
-    if error.class() == ErrorClass::InvalidRequest {
-        error.public_message()
-    } else {
+fn public_invalid_argument_message(err: &(dyn std::error::Error + 'static)) -> Option<String> {
+    let mut current = Some(err);
+    while let Some(error) = current {
+        if let Some(dynamo_err) = error.downcast_ref::<DynamoError>() {
+            return invalid_request_client_message(dynamo_err);
+        }
+        current = error.source();
+    }
+    None
+}
+
+/// Read a non-empty string attribute, treating missing, `None`, and
+/// non-string values as absent.
+fn py_attr_string(value: &Bound<'_, PyAny>, name: &str) -> Option<String> {
+    let attr = value.getattr(name).ok()?;
+    if attr.is_none() {
+        return None;
+    }
+    let message = attr.extract::<String>().ok()?;
+    let message = message.trim();
+    if message.is_empty() {
         None
+    } else {
+        Some(message.to_string())
     }
 }
 
+/// Read a `u16` attribute, treating missing or non-integer values as absent.
+fn py_attr_u16(value: &Bound<'_, PyAny>, name: &str) -> Option<u16> {
+    value.getattr(name).ok()?.extract::<u16>().ok()
+}
 /// Read `(code, message)` off a Python exception carrying an HTTP-style
-/// status. Accepts `.code` (matches [`HttpError`] in `http.rs`) or `.status`
-/// (matches `dynamo.common.http.HttpStatusError`) plus `.message`.
+/// status. Accepts `.code` (matches [`HttpError`] in `http.rs` and
+/// `urllib.error.HTTPError`) or `.status` (matches
+/// `dynamo.common.http.HttpStatusError`).
 ///
-/// SECURITY: `.message` is diagnostic-only. HTTP-like exceptions can wrap remote
+/// The diagnostic text prefers `.message`, then urllib's `.msg` / `.reason`.
+/// It never falls back to `str(exc)`, because some HTTP libraries put the
+/// request URL (and signed query strings) in the exception text.
+///
+/// SECURITY: that text is diagnostic-only. HTTP-like exceptions can wrap remote
 /// fetch failures whose text includes URLs or internal connection details. The
 /// semantic status is preserved, but client renderers use the class catalog
 /// unless the producer raised an explicitly public Dynamo exception.
 pub fn extract_http_like_error(py: Python<'_>, err: &PyErr) -> Option<(u16, String)> {
     let value = err.value(py);
-    let code = value
-        .getattr("code")
-        .ok()
-        .and_then(|a| a.extract::<u16>().ok())
-        .or_else(|| {
-            value
-                .getattr("status")
-                .ok()
-                .and_then(|a| a.extract::<u16>().ok())
-        })?;
-    let message = value.getattr("message").ok()?.extract::<String>().ok()?;
+    let code = py_attr_u16(value, "code").or_else(|| py_attr_u16(value, "status"))?;
+    let message = py_attr_string(value, "message")
+        .or_else(|| py_attr_string(value, "msg"))
+        .or_else(|| py_attr_string(value, "reason"))
+        .unwrap_or_else(|| format!("HTTP {code}"));
     Some((code, message))
 }
 
@@ -211,11 +302,20 @@ pub fn error_class_for_http_status(code: u16) -> ErrorClass {
     }
 }
 
+/// Convert a Python HTTP-like exception into a catalog-classified [`DynamoError`].
+///
+/// Status selects [`ErrorClass`] (403 → [`ErrorClass::PermissionDenied`]). Extracted
+/// text is diagnostic-only so signed material URLs stay out of client bodies.
 pub(crate) fn http_like_error_to_dynamo(py: Python<'_>, err: &PyErr) -> Option<DynamoError> {
     let (code, message) = extract_http_like_error(py, err)?;
     Some(build_http_like_error(code, message))
 }
 
+/// Build the wire error for an HTTP-like Python exception.
+///
+/// Class comes from the status catalog. Diagnostic keeps the original
+/// `{message, code}` payload for legacy readers; `public_message` stays unset
+/// so HTTP renderers use the class catalog rather than raw fetch text.
 fn build_http_like_error(code: u16, message: String) -> DynamoError {
     let legacy_message = serde_json::json!({
         "message": message,
@@ -246,22 +346,91 @@ mod tests {
     }
 
     #[test]
-    fn invalid_request_conversion_uses_only_public_message() {
+    fn worker_unavailable_survives_class_normalization_and_context() {
+        let rejection = DynamoError::builder()
+            .class(ErrorClass::WorkerUnavailable)
+            .message("prefill routing is still activating")
+            .build();
+        // `class()` reports the normalized `Unavailable`; detection must not rely on it.
+        assert_eq!(rejection.class(), ErrorClass::Unavailable);
+        assert!(is_worker_unavailable(&rejection));
+
+        let wrapped = anyhow::Error::from(rejection).context("routed pipeline failed");
+        assert!(is_worker_unavailable(wrapped.as_ref()));
+
+        let pool_unavailable = DynamoError::builder()
+            .class(ErrorClass::Unavailable)
+            .message("no workers")
+            .build();
+        assert!(!is_worker_unavailable(&pool_unavailable));
+    }
+
+    #[test]
+    fn invalid_request_uses_public_message_or_generic_fallback() {
         let error = DynamoError::builder()
             .class(ErrorClass::InvalidRequest)
             .diagnostic("private backend detail")
             .public_message("Invalid JSON schema")
             .build();
         assert_eq!(
-            public_invalid_request_message(&error),
-            Some("Invalid JSON schema")
+            invalid_request_client_message(&error),
+            Some("Invalid JSON schema".to_string())
         );
 
         let error = DynamoError::builder()
             .class(ErrorClass::InvalidRequest)
             .diagnostic("private validation detail")
             .build();
-        assert_eq!(public_invalid_request_message(&error), None);
+        assert_eq!(
+            invalid_request_client_message(&error),
+            Some(GENERIC_INVALID_REQUEST_MESSAGE.to_string())
+        );
+    }
+
+    #[derive(Debug)]
+    struct RouterWrapped(DynamoError);
+
+    impl std::fmt::Display for RouterWrapped {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "Prefill execution failed: {}", self.0)
+        }
+    }
+
+    impl std::error::Error for RouterWrapped {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    #[test]
+    fn error_chain_yields_public_invalid_argument_message() {
+        let worker_error = DynamoError::builder()
+            .class(ErrorClass::InvalidRequest)
+            .diagnostic("private backend detail")
+            .public_message("use --enable-multimodal")
+            .build();
+        let wrapped = anyhow::Error::new(RouterWrapped(worker_error));
+        assert_eq!(
+            public_invalid_argument_message(wrapped.as_ref()),
+            Some("use --enable-multimodal".to_string())
+        );
+    }
+
+    #[test]
+    fn legacy_worker_rejection_without_public_message_yields_generic_message() {
+        let wire = serde_json::json!({
+            "error_type": {"Backend": "InvalidArgument"},
+            "message": "private backend detail",
+        });
+        let error: DynamoError = serde_json::from_value(wire).expect("legacy wire error");
+        assert_eq!(error.class(), ErrorClass::InvalidRequest);
+        assert_eq!(error.public_message(), None);
+
+        let wrapped = anyhow::Error::new(RouterWrapped(error));
+        assert_eq!(
+            public_invalid_argument_message(wrapped.as_ref()),
+            Some(GENERIC_INVALID_REQUEST_MESSAGE.to_string())
+        );
     }
 
     #[test]
@@ -276,13 +445,14 @@ mod tests {
                 .diagnostic("private backend detail")
                 .public_message("Public error message")
                 .build();
-            assert_eq!(public_invalid_request_message(&error), None);
+            assert_eq!(invalid_request_client_message(&error), None);
         }
     }
 
     #[test]
     fn http_like_errors_support_semantic_and_legacy_readers() {
         for (code, expected_class) in [
+            (403, ErrorClass::PermissionDenied),
             (409, ErrorClass::Conflict),
             (415, ErrorClass::UnsupportedMedia),
             (503, ErrorClass::Unavailable),

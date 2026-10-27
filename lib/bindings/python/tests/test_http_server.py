@@ -20,10 +20,12 @@ import contextlib
 import json
 import time
 from typing import AsyncGenerator, Dict
+from urllib.error import HTTPError as UrllibHTTPError
 
 import aiohttp
 import pytest
 
+from dynamo.frontend.utils import PromptLogprobsAccumulator
 from dynamo.llm import HttpAsyncEngine, HttpError, HttpService
 from dynamo.runtime import DistributedRuntime
 
@@ -31,6 +33,7 @@ MSG_CONTAINS_ERROR = "This message contains an 400error."
 MSG_CONTAINS_STATUS_ERROR = "This message contains a 415 status error."
 MSG_CONTAINS_INVALID_ARGUMENT = "This message contains an invalid argument."
 MSG_CONTAINS_INTERNAL_ERROR = "This message contains an internal server error."
+MSG_CONTAINS_URLLIB_403 = "This message contains a urllib 403."
 
 
 class _StatusLikeError(Exception):
@@ -73,6 +76,15 @@ class MockHttpEngine:
             raise HttpError(code=400, message=MSG_CONTAINS_ERROR)
         elif MSG_CONTAINS_STATUS_ERROR.lower() in user_message.lower():
             raise _StatusLikeError(status=415, message=MSG_CONTAINS_STATUS_ERROR)
+        elif MSG_CONTAINS_URLLIB_403.lower() in user_message.lower():
+            # urllib.error.HTTPError has .code and .msg, not .message.
+            raise UrllibHTTPError(
+                "https://example.invalid/material",
+                403,
+                "Forbidden",
+                hdrs=None,
+                fp=None,
+            )
         elif MSG_CONTAINS_INVALID_ARGUMENT.lower() in user_message.lower():
             raise ValueError(MSG_CONTAINS_INVALID_ARGUMENT)
         elif MSG_CONTAINS_INTERNAL_ERROR.lower() in user_message.lower():
@@ -81,9 +93,20 @@ class MockHttpEngine:
         # Stream a mock response
         created = int(time.time())
         response_text = "This is a mock response."
+        prompt_logprobs = PromptLogprobsAccumulator(request)
+        prompt_logprobs.update(
+            {
+                "engine_data": {
+                    "prompt_logprobs": [
+                        None,
+                        {"17": {"logprob": -0.25, "rank": 1}},
+                    ]
+                }
+            }
+        )
         for i, char in enumerate(response_text):
             finish_reason = "stop" if i == len(response_text) - 1 else None
-            yield {
+            chunk = {
                 "id": f"chatcmpl-{context.id()}",
                 "object": "chat.completion.chunk",
                 "created": created,
@@ -96,6 +119,8 @@ class MockHttpEngine:
                     }
                 ],
             }
+            prompt_logprobs.attach(chunk)
+            yield {"_dynamo_annotated": True, "data": chunk}
             await asyncio.sleep(0.01)
 
 
@@ -236,6 +261,12 @@ HTTP_ERROR_CASES = (
         415,
         "Unsupported Media Type",
         "Unsupported Media Type",
+    ),
+    (
+        MSG_CONTAINS_URLLIB_403,
+        403,
+        "Permission denied",
+        "Forbidden",
     ),
     (
         MSG_CONTAINS_INVALID_ARGUMENT,
